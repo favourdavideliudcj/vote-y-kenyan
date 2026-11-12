@@ -1,0 +1,274 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <ctime>
+#include <iomanip>
+#include <algorithm>
+#include <cctype>
+
+// Cross-platform export macro for Python ctypes
+#ifdef _WIN32
+    #define EXPORT extern "C" __declspec(dllexport)
+#else
+    #define EXPORT extern "C"
+#endif
+
+// ==============================================================================
+// DATA STRUCTURES
+// ==============================================================================
+
+struct Voter {
+    std::string id_hash;
+    std::string full_name;
+    std::string county;
+    std::string constituency;
+    std::string polling_station;
+    bool has_voted;
+    std::string voted_at;
+};
+
+struct Candidate {
+    int id;
+    std::string name;
+    std::string party;
+    std::string party_abbr;
+    std::string position;
+    int vote_count;
+};
+
+struct AuditEntry {
+    std::string timestamp;
+    std::string action;
+    std::string details;
+};
+
+// ==============================================================================
+// KENYA ELECTION ENGINE CLASS (THREAD-SAFE)
+// ==============================================================================
+
+class KenyaElectionEngine {
+private:
+    std::unordered_map<std::string, Voter> voters;
+    std::vector<Candidate> candidates;
+    std::vector<AuditEntry> audit_logs;
+    std::mutex engine_mutex;
+    std::string response_buffer;
+    const std::string state_file = "kenya_votes_state.dat";
+
+    // Current formatted timestamp
+    std::string getCurrentTimestamp() {
+        std::time_t now = std::time(nullptr);
+        std::tm* local_tm = std::localtime(&now);
+        std::ostringstream oss;
+        oss << std::put_time(local_tm, "%Y-%m-%d %H:%M:%S");
+        return oss.str();
+    }
+
+    // 64-bit FNV-1a Hash for National ID privacy
+    std::string hashNationalID(const std::string& raw_id) {
+        uint64_t hash = 14695981039346656037ULL;
+        const uint64_t prime = 1099511628211ULL;
+        for (char c : raw_id) {
+            hash ^= static_cast<uint64_t>(c);
+            hash *= prime;
+        }
+        std::ostringstream oss;
+        oss << std::hex << std::setw(16) << std::setfill('0') << hash;
+        return oss.str();
+    }
+
+    // Escape strings for safe JSON output
+    std::string escapeJSON(const std::string& input) {
+        std::ostringstream ss;
+        for (char c : input) {
+            if (c == '"') ss << "\\\"";
+            else if (c == '\\') ss << "\\\\";
+            else if (c == '\n') ss << "\\n";
+            else ss << c;
+        }
+        return ss.str();
+    }
+
+    // Validate Kenyan ID (7 to 9 numeric digits)
+    bool isValidKenyanID(const std::string& id) {
+        if (id.length() < 7 || id.length() > 9) return false;
+        return std::all_of(id.begin(), id.end(), ::isdigit);
+    }
+
+    void addAuditLog(const std::string& action, const std::string& details) {
+        AuditEntry entry{getCurrentTimestamp(), action, details};
+        audit_logs.insert(audit_logs.begin(), entry);
+        if (audit_logs.size() > 100) {
+            audit_logs.pop_back();
+        }
+    }
+
+    // Save current election state to disk
+    void saveState() {
+        std::ofstream out(state_file);
+        if (!out.is_open()) return;
+
+        out << "[VOTERS]\n";
+        for (const auto& pair : voters) {
+            const Voter& v = pair.second;
+            out << v.id_hash << "|" << v.full_name << "|" << v.county << "|"
+                << v.constituency << "|" << v.polling_station << "|"
+                << (v.has_voted ? "1" : "0") << "|" << v.voted_at << "\n";
+        }
+
+        out << "[CANDIDATES]\n";
+        for (const auto& c : candidates) {
+            out << c.id << "|" << c.name << "|" << c.party << "|"
+                << c.party_abbr << "|" << c.position << "|" << c.vote_count << "\n";
+        }
+
+        out << "[LOGS]\n";
+        for (const auto& l : audit_logs) {
+            out << l.timestamp << "|" << l.action << "|" << l.details << "\n";
+        }
+        out.close();
+    }
+
+    // Load election state from disk if available
+    bool loadState() {
+        std::ifstream in(state_file);
+        if (!in.is_open()) return false;
+
+        voters.clear();
+        candidates.clear();
+        audit_logs.clear();
+
+        std::string line, section;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            if (line == "[VOTERS]" || line == "[CANDIDATES]" || line == "[LOGS]") {
+                section = line;
+                continue;
+            }
+
+            std::stringstream ss(line);
+            std::string item;
+            std::vector<std::string> tokens;
+            while (std::getline(ss, item, '|')) {
+                tokens.push_back(item);
+            }
+
+            if (section == "[VOTERS]" && tokens.size() >= 6) {
+                Voter v;
+                v.id_hash = tokens[0];
+                v.full_name = tokens[1];
+                v.county = tokens[2];
+                v.constituency = tokens[3];
+                v.polling_station = tokens[4];
+                v.has_voted = (tokens[5] == "1");
+                v.voted_at = (tokens.size() > 6) ? tokens[6] : "";
+                voters[v.id_hash] = v;
+            } else if (section == "[CANDIDATES]" && tokens.size() == 6) {
+                Candidate c;
+                c.id = std::stoi(tokens[0]);
+                c.name = tokens[1];
+                c.party = tokens[2];
+                c.party_abbr = tokens[3];
+                c.position = tokens[4];
+                c.vote_count = std::stoi(tokens[5]);
+                candidates.push_back(c);
+            } else if (section == "[LOGS]" && tokens.size() == 3) {
+                audit_logs.push_back({tokens[0], tokens[1], tokens[2]});
+            }
+        }
+        in.close();
+        return !candidates.empty();
+    }
+
+    void seedDefaultData() {
+        // Seed Kenyan Voters
+        std::vector<std::tuple<std::string, std::string, std::string, std::string, std::string>> default_voters = {
+            {"12345678", "Wanjiku Kamau", "Nairobi", "Westlands", "Parklands Primary School"},
+            {"23456789", "Otieno Odhiambo", "Homa Bay", "Homa Bay Town", "Arujo Primary School"},
+            {"34567890", "Amina Hassan", "Mombasa", "Mvita", "Star of the Sea School"},
+            {"45678901", "Kiprop Chebet", "Uasin Gishu", "Ainabkoi", "Kapsoya Secondary School"},
+            {"56789012", "Mutua Musyoka", "Machakos", "Machakos Town", "Machakos Primary School"}
+        };
+
+        for (const auto& dv : default_voters) {
+            std::string h = hashNationalID(std::get<0>(dv));
+            voters[h] = {h, std::get<1>(dv), std::get<2>(dv), std::get<3>(dv), std::get<4>(dv), false, ""};
+        }
+
+        // Seed Candidates
+        candidates = {
+            {1, "Jomo Mwangi", "Umoja Democratic Party", "UDP", "President", 0},
+            {2, "Fatuma Ali", "Kenya Progressive Alliance", "KPA", "President", 0},
+            {3, "David Kipkorir", "Green Future Movement", "GFM", "President", 0},
+
+            {4, "Grace Nyambura", "Umoja Democratic Party", "UDP", "Governor", 0},
+            {5, "Peter Onyango", "Kenya Progressive Alliance", "KPA", "Governor", 0},
+            {6, "Samuel Koech", "Independent Candidate", "IND", "Governor", 0},
+
+            {7, "Esther Mwikali", "Umoja Democratic Party", "UDP", "Member of Parliament", 0},
+            {8, "Hassan Omar", "Kenya Progressive Alliance", "KPA", "Member of Parliament", 0},
+            {9, "Brian Njoroge", "Green Future Movement", "GFM", "Member of Parliament", 0}
+        };
+
+        addAuditLog("SYSTEM_BOOT", "C++ Election Engine initialized with default Kenyan register.");
+        saveState();
+    }
+
+public:
+    KenyaElectionEngine() {
+        if (!loadState()) {
+            seedDefaultData();
+        }
+    }
+
+    const char* verifyVoter(const std::string& national_id) {
+        std::lock_guard<std::mutex> lock(engine_mutex);
+
+        if (!isValidKenyanID(national_id)) {
+            response_buffer = R"({"status":"error","message":"Invalid National ID. Must be 7 to 9 digits."})";
+            return response_buffer.c_str();
+        }
+
+        std::string h = hashNationalID(national_id);
+        auto it = voters.find(h);
+
+        if (it == voters.end()) {
+            addAuditLog("FAILED_VERIFY", "Unregistered National ID attempted verification.");
+            saveState();
+            response_buffer = R"({"status":"error","message":"National ID not found in the Kenyan register."})";
+            return response_buffer.c_str();
+        }
+
+        if (it->second.has_voted) {
+            addAuditLog("DUPLICATE_BLOCK", "Blocked repeat vote attempt in " + it->second.county + " County.");
+            saveState();
+            response_buffer = R"({"status":"error","message":"Access Denied: Ballot already cast on )" +
+                              escapeJSON(it->second.voted_at) + R"("})";
+            return response_buffer.c_str();
+        }
+
+        addAuditLog("VOTER_VERIFIED", "Verified voter at " + it->second.polling_station + ".");
+        saveState();
+
+        std::ostringstream json;
+        json << R"({"status":"success","voter":{)"
+             << R"("full_name":")" << escapeJSON(it->second.full_name) << R"(",)"
+             << R"("county":")" << escapeJSON(it->second.county) << R"(",)"
+             << R"("constituency":")" << escapeJSON(it->second.constituency) << R"(",)"
+             << R"("polling_station":")" << escapeJSON(it->second.polling_station) << R"("}})";
+        response_buffer = json.str();
+        return response_buffer.c_str();
+    }
+
+    const char* castVote(const std::string& national_id, int pres_id, int gov_id, int mp_id) {
+        std::lock_guard<std::mutex> lock(engine_mutex);
+
+        if (!isValidKenyanID(national_id)) {
+            response_buffer = R"({"status":"error","message":"Invalid National ID."})";
+            return response_buffer.c_str();
+        }
+
